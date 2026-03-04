@@ -5,14 +5,16 @@ from datetime import datetime, timedelta, timezone
 from dateutil import tz
 from openai import OpenAI
 
-# 环境变量
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+# 环境变量（豆包）
+DOUBAO_API_KEY = os.getenv("DOUBAO_API_KEY")
+DOUBAO_MODEL_ID = os.getenv("DOUBAO_MODEL_ID")  # 形如 ep-xxxxxxxxxxxx
 FEISHU_WEBHOOK_URL = os.getenv("FEISHU_WEBHOOK_URL")
 
-# DeepSeek 客户端（OpenAI 兼容）
+# 豆包（Doubao）客户端：使用 OpenAI 兼容接口
+# base_url 为火山引擎 Ark 的 OpenAI 兼容地址
 client = OpenAI(
-    api_key=DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com"
+    api_key=DOUBAO_API_KEY,
+    base_url="https://ark.cn-beijing.volces.com/api/v3"
 )
 
 # 36氪 主站 RSS
@@ -52,7 +54,7 @@ def filter_entries_by_yesterday(entries, start_dt, end_dt):
         if not published_parsed:
             continue
 
-        # 先当成 UTC，再转北京时间（多数 RSS 如此；有误差也问题不大）
+        # 通常 RSS 时间是 UTC，这里先当 UTC，再转北京时间
         dt_utc = datetime(*published_parsed[:6], tzinfo=timezone.utc)
         dt_cn = dt_utc.astimezone(timezone(timedelta(hours=8)))
 
@@ -97,12 +99,16 @@ def build_llm_prompt_36kr(date_str, entries_with_time):
     return "\n".join(lines)
 
 
-def summarize_with_deepseek(prompt):
+def summarize_with_doubao(prompt):
     """
-    调用 DeepSeek 生成摘要
+    调用豆包（Doubao）生成摘要
+    DOUBAO_MODEL_ID 应为 Ark 控制台中接入点 ID（ep-xxxx 形式）
     """
+    if not DOUBAO_MODEL_ID:
+        raise RuntimeError("请设置环境变量 DOUBAO_MODEL_ID（豆包推理接入点 ID，形如 ep-xxxx）。")
+
     resp = client.chat.completions.create(
-        model="deepseek-chat",
+        model=DOUBAO_MODEL_ID,
         messages=[
             {"role": "system", "content": "你是一名严谨的中文科技与商业新闻编辑，擅长从 36氪 等媒体中提炼有价值的热点。"},
             {"role": "user", "content": prompt},
@@ -130,8 +136,8 @@ def send_to_feishu(text):
 
 
 def main():
-    if not DEEPSEEK_API_KEY or not FEISHU_WEBHOOK_URL:
-        raise RuntimeError("请确保 DEEPSEEK_API_KEY、FEISHU_WEBHOOK_URL 已配置为环境变量。")
+    if not DOUBAO_API_KEY or not FEISHU_WEBHOOK_URL:
+        raise RuntimeError("请确保 DOUBAO_API_KEY、DOUBAO_MODEL_ID、FEISHU_WEBHOOK_URL 已配置为环境变量。")
 
     start_dt, end_dt, date_str = get_yesterday_range_cn()
 
@@ -150,8 +156,8 @@ def main():
     # 3）构造给大模型的提示词
     prompt = build_llm_prompt_36kr(date_str, entries_yesterday)
 
-    # 4）让 DeepSeek 总结
-    summary = summarize_with_deepseek(prompt)
+    # 4）让豆包总结
+    summary = summarize_with_doubao(prompt)
 
     # 5）发到飞书
     final_text = f"【36氪 · 昨日热点播报】{date_str}\n\n" + summary
