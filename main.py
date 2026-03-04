@@ -19,16 +19,45 @@ client = OpenAI(
 # 36氪 主站 RSS
 KR36_RSS_URL = "https://36kr.com/feed"
 
-# AI 相关 RSS 源（先从 arXiv 开始，后续可以在这里加媒体 / RSSHub 源）
+# 英文 AI / 技术圈 RSS 源（论文 + 技术社区热门）
 AI_RSS_SOURCES = {
-    # 人工智能总类
+    # 学术 / 论文：AI 相关的 arXiv 分类
     "arxiv_cs_ai": "https://export.arxiv.org/rss/cs.AI",
-    # 机器学习
     "arxiv_cs_lg": "https://export.arxiv.org/rss/cs.LG",
-    # 自然语言处理
     "arxiv_cs_cl": "https://export.arxiv.org/rss/cs.CL",
-    # 计算机视觉
     "arxiv_cs_cv": "https://export.arxiv.org/rss/cs.CV",
+
+    # Hacker News 热门（首页，已经按热度排序，经常包含 AI 重大新闻）
+    "hn_frontpage": "https://hnrss.org/frontpage",
+
+    # Hacker News 最新中包含 AI 关键词的帖子
+    "hn_ai_newest": "https://hnrss.org/newest?q=ai+OR+%22artificial+intelligence%22+OR+%22large+language+model%22",
+
+    # Reddit: 机器学习社区，按最近一天的热门排序
+    "reddit_MachineLearning_top_day": "https://www.reddit.com/r/MachineLearning/top/.rss?t=day",
+
+    # Reddit: 本地大模型 / 开源 LLM 社区，最近一天热门
+    "reddit_LocalLLaMA_top_day": "https://www.reddit.com/r/LocalLLaMA/top/.rss?t=day",
+}
+
+# 中文社区热门 RSS 源（通过 RSSHub 等聚合服务）
+# 注意：下面这些 URL 需要对应服务可访问，如果某个源暂时不可用，不会影响整体运行，只是少一些条目。
+CN_COMMUNITY_RSS_SOURCES = {
+    # B站：全站热门视频（示例路由，来自 RSSHub）
+    # 文档：https://docs.rsshub.app/zh/social-media.html#bi-li-bi-li
+    "bilibili_hot": "https://rsshub.app/bilibili/popular/all",
+
+    # 微信：热门文章（示例路由，具体以 RSSHub 文档为准）
+    # 有些部署使用 /wechat/mp/hot，具体可能略有差异
+    "wechat_hot": "https://rsshub.app/wechat/mp/hot",
+
+    # 小红书：热门笔记（示例路由）
+    # 文档：https://docs.rsshub.app/zh/social-media.html#xiao-hong-shu
+    "xiaohongshu_hot": "https://rsshub.app/xiaohongshu/hot",
+
+    # 知乎：热榜
+    # 文档：https://docs.rsshub.app/zh/social-media.html#zhi-hu
+    "zhihu_hot": "https://rsshub.app/zhihu/hotlist",
 }
 
 
@@ -77,9 +106,9 @@ def filter_entries_by_yesterday(entries, start_dt, end_dt):
 
 def fetch_ai_feeds():
     """
-    拉取多路 AI 相关 RSS，合并成一个列表，带来源标签
+    拉取多路 AI 相关 & 中英文社区热门 RSS，合并成一个列表，带来源标签
     返回: List[dict]，每个 dict:
-      - source: 源名称，如 'arxiv_cs_ai'
+      - source: 源名称，如 'arxiv_cs_ai' / 'bilibili_hot'
       - title: 标题
       - summary: 摘要
       - link: 链接
@@ -91,7 +120,12 @@ def fetch_ai_feeds():
     now = datetime.now(tz_cn)
     earliest = now - timedelta(days=2)
 
-    for source_name, url in AI_RSS_SOURCES.items():
+    # 把英文技术源和中文社区源合并
+    all_sources = {}
+    all_sources.update(AI_RSS_SOURCES)
+    all_sources.update(CN_COMMUNITY_RSS_SOURCES)
+
+    for source_name, url in all_sources.items():
         try:
             feed = feedparser.parse(url)
         except Exception as e:
@@ -107,19 +141,20 @@ def fetch_ai_feeds():
             link = getattr(entry, "link", "") or entry.get("link", "")
             summary = getattr(entry, "summary", "") or entry.get("summary", "")
 
+            if not title or not link:
+                continue
+
             published_parsed = getattr(entry, "published_parsed", None) or entry.get("published_parsed")
             if not published_parsed:
                 # 没有时间就当最近
                 dt_cn = now
             else:
+                # 大多数 RSS 是 UTC，这里当 UTC 处理
                 dt_utc = datetime(*published_parsed[:6], tzinfo=timezone.utc)
                 dt_cn = dt_utc.astimezone(tz_cn)
 
             # 只要最近 2 天的
             if dt_cn < earliest:
-                continue
-
-            if not title or not link:
                 continue
 
             items.append({
@@ -138,7 +173,7 @@ def fetch_ai_feeds():
 
 def build_llm_prompt_with_ai(date_str, entries_with_time, ai_items):
     """
-    综合 36氪 + 多路 AI 数据源，构造给豆包的大 Prompt
+    综合 36氪 + 多路 AI / 社区热门数据源，构造给豆包的大 Prompt
     """
     lines = []
 
@@ -173,17 +208,22 @@ def build_llm_prompt_with_ai(date_str, entries_with_time, ai_items):
 
     # AI 专栏部分要求
     lines.append("【AI 专栏部分要求】")
-    lines.append("1. 只保留真正重要或有代表性的 AI 相关内容（论文、技术突破、产品发布、政策、社区大热讨论等）。")
-    lines.append("2. 请从以下角度判断“最热点”：")
-    lines.append("   - 是否来自权威会议/知名机构/头部公司（如 arXiv 上高关注度论文、大厂发布等）；")
-    lines.append("   - 是否在社区中有显著讨论热度（浏览量、点赞量、评论量很高，或在多个社区被反复提及）；")
+    lines.append("1. AI 相关原始素材中，source 字段可能包含：")
+    lines.append("   - arxiv_xxx：代表 arXiv 上的学术论文；")
+    lines.append("   - hn_xxx / reddit_xxx：代表英文技术社区的热门讨论；")
+    lines.append("   - bilibili_xxx / wechat_xxx / xiaohongshu_xxx / zhihu_xxx：代表中文社区的热门内容（B站、公众号、小红书、知乎等）。")
+    lines.append("2. 只保留真正重要或有代表性的 AI 相关内容（论文、技术突破、产品发布、政策、社区大热讨论等）。")
+    lines.append("3. 请从以下角度判断“最热点”：")
+    lines.append("   - 是否来自权威会议/知名机构/头部公司；")
+    lines.append("   - 是否在社区中有显著讨论热度，例如：来自 B站/公众号/小红书/知乎 等平台的高播放、高点赞、高评论内容（即使 RSS 中没有具体数字，也请根据标题、描述和来源进行合理判断）；")
     lines.append("   - 是否对行业方向/大模型能力/产品形态产生显著影响。")
-    lines.append("3. AI 专栏的条目总数控制在 5~10 条之间，优先保证质量。")
-    lines.append("4. 每条 AI 热点请包含：")
+    lines.append("4. AI 专栏的条目总数控制在 5~10 条之间，优先保证质量。")
+    lines.append("5. 每条 AI 热点请包含：")
     lines.append("   - 【高/中/低】热度等级 + 一句话标题；")
     lines.append("   - 1~3 句核心说明（做了什么 / 关键创新点 / 可能影响）；")
     lines.append("   - 至少给出 1 个可直接访问的原文链接（论文 / 新闻 / 帖子），链接请用 Markdown 形式，例如：[标题](链接)。")
-    lines.append("5. 如果多条来源指向同一事件，请合并为一条，并在说明中点出“多处社区/媒体讨论”。")
+    lines.append("6. 如果多条来源指向同一事件，请合并为一条，并在说明中点出“多处社区/媒体讨论”。")
+    lines.append("7. 明显与 AI / 大模型 / AIGC / 智能体 无关的热门内容，即使热度很高也可以忽略。")
     lines.append("")
 
     # 整体输出结构
@@ -212,9 +252,9 @@ def build_llm_prompt_with_ai(date_str, entries_with_time, ai_items):
             lines.append(f"链接：{link}")
         lines.append("")
 
-    # 附上 AI 原始素材
+    # 附上 AI / 社区原始素材
     lines.append("")
-    lines.append("【以下是 AI 相关原始素材（来自 arXiv 等多路 RSS，时间为北京时间）】")
+    lines.append("【以下是 AI 相关原始素材（来自 arXiv / Hacker News / Reddit / B站 / 微信 / 小红书 / 知乎 等多路 RSS，时间为北京时间）】")
     lines.append("")
     for idx, item in enumerate(ai_items, 1):
         lines.append(f"【AI条目 {idx}】")
@@ -248,6 +288,8 @@ def summarize_with_doubao(prompt):
                     "你是一名极其挑剔的中文科技与商业新闻编辑。"
                     "你的目标是：在保证信息准确的前提下，尽量减少无价值或重复的信息，"
                     "只保留真正影响趋势、行业格局或关键参与方决策的事件，并为读者节省时间。"
+                    "当 source 显示为 bilibili/wechat/xiaohongshu/zhihu 时，"
+                    "请将其视为中文社区热门内容的来源，优先在 AI 专栏中筛选出与 AI / 大模型 / AIGC 相关且热度高的条目。"
                     "请严格按照用户给出的输出结构和分级要求组织内容。"
                 ),
             },
@@ -285,7 +327,7 @@ def main():
     entries = fetch_36kr_rss()
     entries_yesterday = filter_entries_by_yesterday(entries, start_dt, end_dt)
 
-    # 2）AI 专栏数据（arXiv 及后续扩展）
+    # 2）AI 专栏数据（arXiv + HN + Reddit + 中文社区热榜）
     ai_items = fetch_ai_feeds()
 
     if not entries_yesterday and not ai_items:
