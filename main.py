@@ -5,13 +5,12 @@ from datetime import datetime, timedelta, timezone
 from dateutil import tz
 from openai import OpenAI
 
-# 环境变量（豆包）
+# 环境变量（豆包 + 飞书）
 DOUBAO_API_KEY = os.getenv("DOUBAO_API_KEY")
 DOUBAO_MODEL_ID = os.getenv("DOUBAO_MODEL_ID")  # 形如 ep-xxxxxxxxxxxx
 FEISHU_WEBHOOK_URL = os.getenv("FEISHU_WEBHOOK_URL")
 
 # 豆包（Doubao）客户端：使用 OpenAI 兼容接口
-# base_url 为火山引擎 Ark 的 OpenAI 兼容地址
 client = OpenAI(
     api_key=DOUBAO_API_KEY,
     base_url="https://ark.cn-beijing.volces.com/api/v3"
@@ -19,6 +18,18 @@ client = OpenAI(
 
 # 36氪 主站 RSS
 KR36_RSS_URL = "https://36kr.com/feed"
+
+# AI 相关 RSS 源（先从 arXiv 开始，后续可以在这里加媒体 / RSSHub 源）
+AI_RSS_SOURCES = {
+    # 人工智能总类
+    "arxiv_cs_ai": "https://export.arxiv.org/rss/cs.AI",
+    # 机器学习
+    "arxiv_cs_lg": "https://export.arxiv.org/rss/cs.LG",
+    # 自然语言处理
+    "arxiv_cs_cl": "https://export.arxiv.org/rss/cs.CL",
+    # 计算机视觉
+    "arxiv_cs_cv": "https://export.arxiv.org/rss/cs.CV",
+}
 
 
 def get_yesterday_range_cn():
@@ -28,7 +39,9 @@ def get_yesterday_range_cn():
     """
     tz_cn = timezone(timedelta(hours=8))
     now = datetime.now(tz_cn)
-    yesterday = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday = (now - timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
     start = yesterday
     end = yesterday.replace(hour=23, minute=59, second=59)
     date_str = yesterday.strftime("%Y-%m-%d")
@@ -49,7 +62,6 @@ def filter_entries_by_yesterday(entries, start_dt, end_dt):
     """
     result = []
     for e in entries:
-        # published_parsed 是 struct_time，需要转成 datetime
         published_parsed = getattr(e, "published_parsed", None) or e.get("published_parsed")
         if not published_parsed:
             continue
@@ -63,37 +75,157 @@ def filter_entries_by_yesterday(entries, start_dt, end_dt):
     return result
 
 
-def build_llm_prompt_36kr(date_str, entries_with_time):
+def fetch_ai_feeds():
     """
-    基于 36氪 昨日文章，构造给大模型的提示词
+    拉取多路 AI 相关 RSS，合并成一个列表，带来源标签
+    返回: List[dict]，每个 dict:
+      - source: 源名称，如 'arxiv_cs_ai'
+      - title: 标题
+      - summary: 摘要
+      - link: 链接
+      - published: datetime（北京时间）
+    只保留最近 2 天内的条目，并每个源最多取 30 条，避免过长。
+    """
+    items = []
+    tz_cn = timezone(timedelta(hours=8))
+    now = datetime.now(tz_cn)
+    earliest = now - timedelta(days=2)
+
+    for source_name, url in AI_RSS_SOURCES.items():
+        try:
+            feed = feedparser.parse(url)
+        except Exception as e:
+            print(f"Error parsing AI feed {source_name}: {e}")
+            continue
+
+        count = 0
+        for entry in feed.entries:
+            if count >= 30:
+                break
+
+            title = getattr(entry, "title", "") or entry.get("title", "")
+            link = getattr(entry, "link", "") or entry.get("link", "")
+            summary = getattr(entry, "summary", "") or entry.get("summary", "")
+
+            published_parsed = getattr(entry, "published_parsed", None) or entry.get("published_parsed")
+            if not published_parsed:
+                # 没有时间就当最近
+                dt_cn = now
+            else:
+                dt_utc = datetime(*published_parsed[:6], tzinfo=timezone.utc)
+                dt_cn = dt_utc.astimezone(tz_cn)
+
+            # 只要最近 2 天的
+            if dt_cn < earliest:
+                continue
+
+            if not title or not link:
+                continue
+
+            items.append({
+                "source": source_name,
+                "title": title,
+                "summary": summary,
+                "link": link,
+                "published": dt_cn,
+            })
+            count += 1
+
+    # 按时间倒序排序，让最近的在前
+    items.sort(key=lambda x: x["published"], reverse=True)
+    return items
+
+
+def build_llm_prompt_with_ai(date_str, entries_with_time, ai_items):
+    """
+    综合 36氪 + 多路 AI 数据源，构造给豆包的大 Prompt
     """
     lines = []
-    lines.append(f"你是一名专业的中文科技与商业新闻编辑，请根据下面 36氪 在 {date_str} 发布的文章，生成一份「昨日热点摘要」，用于发到飞书群。")
+
+    # 整体目标
+    lines.append(f"你是一名资深中文科技与商业新闻编辑，需要为飞书群制作一份「{date_str} 的每日热点摘要」，包含：")
+    lines.append("1）综合科技/商业资讯（主要来自 36氪）")
+    lines.append("2）AI 专栏：最新最热点的 AI 相关内容（论文、技术报道、社区高热度帖子等）")
     lines.append("")
-    lines.append("要求：")
-    lines.append("1. 从中筛选出对科技、商业、创业、消费、宏观趋势等真正有价值的热点，合并相似主题。")
-    lines.append("2. 归纳成几个板块（例如：科技 / 创业融资 / 行业趋势 / 政策监管 / 消费与生活 等），不必强行每个板块都有。")
-    lines.append("3. 每条热点：先一句话总结，再补充 1~3 句关键信息。")
-    lines.append("4. 在适当位置点名一句『据 36氪报道』，但不要每条都重复。")
-    lines.append("5. 最后给出一个 2~4 句的总览小结，概括昨日整体风向。")
-    lines.append("6. 输出请直接用 Markdown 风格的分级标题和列表，适合在飞书中直接阅读。")
-    lines.append("")
-    lines.append("下面是昨日的 36氪 文章列表：")
+    lines.append("读者是忙碌的职场人，希望 2~3 分钟把握昨天的重要动态，尤其是 AI 相关的大事。")
+    lines.append("请尽量少而精，宁可少、不要碎。")
     lines.append("")
 
+    # 综合资讯部分要求（分级 + 聚焦）
+    lines.append("【综合资讯部分要求】")
+    lines.append("1. 从 36氪 文章中筛选对「科技 / 商业 / 创业 / 投融资 / 行业趋势 / 政策监管」有实质信息价值的事件。")
+    lines.append("2. 宁可少、不要碎：")
+    lines.append("   - 优先：政策与监管变化、大厂或头部公司动态、重大融资与并购、新产品/新技术里程碑、影响一个行业走向的趋势。")
+    lines.append("   - 弱化：单一小公司软文、纯宣传稿件、对宏观趋势无实际影响的小新闻。")
+    lines.append("3. 全文综合资讯热点总数控制在 8~12 条之间，最多不超过 15 条。")
+    lines.append("4. 对高度重复/同一事件的多篇报道要合并成一条。")
+    lines.append("5. 请按板块分组输出，例如（并不要求全部都用）：")
+    lines.append("   - 科技与产品")
+    lines.append("   - 创业与投融资")
+    lines.append("   - 行业与商业趋势")
+    lines.append("   - 政策与监管")
+    lines.append("   - 消费与生活方式")
+    lines.append("6. 每条热点请标注影响力等级：【高】【中】【低】 三档之一，并总体按【高】在前，【低】在后排序。")
+    lines.append("   - 【高】：对一个行业/赛道/宏观环境有显著影响，大厂/监管层/资本市场高度相关。")
+    lines.append("   - 【中】：对某一细分领域、部分公司有实质影响，值得相关从业者了解。")
+    lines.append("   - 【低】：有一定参考价值，但对整体格局影响有限，可作为补充阅读。")
+    lines.append("")
+
+    # AI 专栏部分要求
+    lines.append("【AI 专栏部分要求】")
+    lines.append("1. 只保留真正重要或有代表性的 AI 相关内容（论文、技术突破、产品发布、政策、社区大热讨论等）。")
+    lines.append("2. 请从以下角度判断“最热点”：")
+    lines.append("   - 是否来自权威会议/知名机构/头部公司（如 arXiv 上高关注度论文、大厂发布等）；")
+    lines.append("   - 是否在社区中有显著讨论热度（浏览量、点赞量、评论量很高，或在多个社区被反复提及）；")
+    lines.append("   - 是否对行业方向/大模型能力/产品形态产生显著影响。")
+    lines.append("3. AI 专栏的条目总数控制在 5~10 条之间，优先保证质量。")
+    lines.append("4. 每条 AI 热点请包含：")
+    lines.append("   - 【高/中/低】热度等级 + 一句话标题；")
+    lines.append("   - 1~3 句核心说明（做了什么 / 关键创新点 / 可能影响）；")
+    lines.append("   - 至少给出 1 个可直接访问的原文链接（论文 / 新闻 / 帖子），链接请用 Markdown 形式，例如：[标题](链接)。")
+    lines.append("5. 如果多条来源指向同一事件，请合并为一条，并在说明中点出“多处社区/媒体讨论”。")
+    lines.append("")
+
+    # 整体输出结构
+    lines.append("【整体输出结构（请严格按此顺序输出）】")
+    lines.append("1. 顶部：2~4 句的【昨天整体风向小结】。")
+    lines.append("2. 中部第一部分标题：`## 综合资讯`，按板块 +【高/中/低】分级列出。")
+    lines.append("3. 中部第二部分标题：`## AI 专栏`，单独列出 AI 相关热点，同样按【高/中/低】分级。")
+    lines.append("4. 底部：给读者 1~2 条“后续可关注方向”的建议，尤其是 AI 领域。")
+    lines.append("")
+
+    # 附上综合资讯原始素材（36氪）
+    lines.append("【以下是综合资讯原始素材（36氪 昨日文章，按北京时间）】")
+    lines.append("")
     for idx, (e, dt_cn) in enumerate(entries_with_time, 1):
         title = getattr(e, "title", "") or e.get("title", "")
         summary = getattr(e, "summary", "") or e.get("summary", "")
         link = getattr(e, "link", "") or e.get("link", "")
         published_str = dt_cn.strftime("%Y-%m-%d %H:%M")
 
-        lines.append(f"【文章 {idx}】")
+        lines.append(f"【36氪文章 {idx}】")
         lines.append(f"标题：{title}")
         lines.append(f"时间（北京）：{published_str}")
         if summary:
             lines.append(f"摘要：{summary}")
         if link:
             lines.append(f"链接：{link}")
+        lines.append("")
+
+    # 附上 AI 原始素材
+    lines.append("")
+    lines.append("【以下是 AI 相关原始素材（来自 arXiv 等多路 RSS，时间为北京时间）】")
+    lines.append("")
+    for idx, item in enumerate(ai_items, 1):
+        lines.append(f"【AI条目 {idx}】")
+        lines.append(f"来源：{item.get('source', '')}")
+        lines.append(f"标题：{item.get('title', '')}")
+        if item.get("summary"):
+            lines.append(f"摘要：{item['summary']}")
+        if item.get("link"):
+            lines.append(f"链接：{item['link']}")
+        if item.get("published"):
+            lines.append(f"时间：{item['published'].strftime('%Y-%m-%d %H:%M')}")
         lines.append("")
 
     return "\n".join(lines)
@@ -110,10 +242,18 @@ def summarize_with_doubao(prompt):
     resp = client.chat.completions.create(
         model=DOUBAO_MODEL_ID,
         messages=[
-            {"role": "system", "content": "你是一名严谨的中文科技与商业新闻编辑，擅长从 36氪 等媒体中提炼有价值的热点。"},
+            {
+                "role": "system",
+                "content": (
+                    "你是一名极其挑剔的中文科技与商业新闻编辑。"
+                    "你的目标是：在保证信息准确的前提下，尽量减少无价值或重复的信息，"
+                    "只保留真正影响趋势、行业格局或关键参与方决策的事件，并为读者节省时间。"
+                    "请严格按照用户给出的输出结构和分级要求组织内容。"
+                ),
+            },
             {"role": "user", "content": prompt},
         ],
-        temperature=0.6,
+        temperature=0.5,
         max_tokens=2000,
     )
     return resp.choices[0].message.content
@@ -141,26 +281,27 @@ def main():
 
     start_dt, end_dt, date_str = get_yesterday_range_cn()
 
-    # 1）拉取 36氪 RSS
+    # 1）综合资讯（36氪）
     entries = fetch_36kr_rss()
-
-    # 2）过滤出昨天的文章
     entries_yesterday = filter_entries_by_yesterday(entries, start_dt, end_dt)
 
-    if not entries_yesterday:
-        text = f"【昨日热点播报】{date_str}\n\n昨日在 36氪 上未检测到新的文章（或 RSS 抓取异常），请稍后再试或手动查看。"
+    # 2）AI 专栏数据（arXiv 及后续扩展）
+    ai_items = fetch_ai_feeds()
+
+    if not entries_yesterday and not ai_items:
+        text = f"【每日热点播报】{date_str}\n\n昨日未检测到新的资讯和 AI 相关条目（或 RSS 抓取异常），请稍后再试或手动查看。"
         send_to_feishu(text)
         print("No entries for yesterday, sent notice to Feishu.")
         return
 
-    # 3）构造给大模型的提示词
-    prompt = build_llm_prompt_36kr(date_str, entries_yesterday)
+    # 3）构造给大模型的提示词（包含综合 + AI 专栏）
+    prompt = build_llm_prompt_with_ai(date_str, entries_yesterday, ai_items)
 
-    # 4）让豆包总结
+    # 4）让豆包生成完整日报
     summary = summarize_with_doubao(prompt)
 
     # 5）发到飞书
-    final_text = f"【36氪 · 昨日热点播报】{date_str}\n\n" + summary
+    final_text = f"【每日热点 · {date_str}】\n\n" + summary
     resp = send_to_feishu(final_text)
     print("Feishu response:", resp)
 
