@@ -26,7 +26,8 @@
 
          - name: Run script
            env:
-             DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+             DOUBAO_API_KEY: ${{ secrets.DOUBAO_API_KEY }}
+             DOUBAO_MODEL_ID: ${{ secrets.DOUBAO_MODEL_ID }}
              FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
            run: |
              python main.py
